@@ -7,7 +7,9 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import stat
+import subprocess
 import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -34,6 +36,7 @@ MAX_PROMPT_CHARS = 50_000
 MAX_RESPONSE_CHARS = 100_000
 MAX_PROGRESS_TAIL_CHARS = 1_200
 DEFAULT_READINESS_TIMEOUT_SECONDS = 30.0
+STALE_OWNERSHIP_RECOVERY_GRACE_SECONDS = 60.0
 CHATGPT_ORIGIN_GUARD_JS = """
 const currentUrl = new URL(location.href);
 const currentHost = currentUrl.hostname.toLowerCase().replace(/\\.$/, '');
@@ -297,14 +300,89 @@ class ChatGPTWebBridge:
 			f"Confirm the dedicated browser is stopped, remove {marker}, then restart the MCP server."
 		)
 
+	def _profile_browser_pids(self) -> list[int] | None:
+		"""Return processes that explicitly own this exact browser profile.
+
+		A persisted ``.unclean`` marker survives an MCP crash by design, but an
+		empty marker alone cannot distinguish a live orphaned Chrome from a stale
+		tombstone. Inspect argv while the cross-process profile flock is held and
+		only recover when process inspection succeeds and no process names this
+		exact ``--user-data-dir``. ``None`` means inspection failed and callers
+		must stay fail-closed.
+		"""
+		try:
+			result = subprocess.run(
+				["pgrep", "-fl", re.escape(str(self.profile_dir))],
+				capture_output=True,
+				text=True,
+				timeout=5,
+				check=False,
+			)
+		except (OSError, subprocess.SubprocessError):
+			return None
+		# pgrep uses 1 for a clean no-match result; any other non-zero status
+		# means process ownership could not be established safely.
+		if result.returncode == 1:
+			return []
+		if result.returncode != 0:
+			return None
+
+		owners: list[int] = []
+		for line in result.stdout.splitlines():
+			parts = line.strip().split(None, 1)
+			if len(parts) != 2:
+				continue
+			try:
+				pid = int(parts[0])
+				argv = shlex.split(parts[1])
+			except (ValueError, TypeError):
+				continue
+			if pid == os.getpid():
+				continue
+
+			profile_values: list[str] = []
+			for index, arg in enumerate(argv):
+				if arg.startswith("--user-data-dir="):
+					profile_values.append(arg.split("=", 1)[1])
+				elif arg == "--user-data-dir" and index + 1 < len(argv):
+					profile_values.append(argv[index + 1])
+			for value in profile_values:
+				try:
+					candidate = Path(value).expanduser().resolve(strict=False)
+				except (OSError, RuntimeError):
+					continue
+				if candidate == self.profile_dir:
+					owners.append(pid)
+					break
+		return sorted(set(owners))
+
+	def _recover_stale_ownership_marker(self, marker: Path, info: os.stat_result) -> bool:
+		"""Clear an old marker only after proving this profile has no process owner."""
+		if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+			return False
+		if time.time() - info.st_mtime < STALE_OWNERSHIP_RECOVERY_GRACE_SECONDS:
+			return False
+		owners = self._profile_browser_pids()
+		if owners is None or owners:
+			return False
+		try:
+			marker.unlink()
+		except FileNotFoundError:
+			return True
+		except OSError:
+			return False
+		return True
+
 	def _assert_no_stale_ownership_marker(self) -> None:
 		marker = self._ownership_marker_file()
 		try:
-			marker.lstat()
+			info = marker.lstat()
 		except FileNotFoundError:
 			return
 		except OSError as exc:
 			raise ChatGPTWebError("The ChatGPT browser ownership marker could not be inspected safely.") from exc
+		if self._recover_stale_ownership_marker(marker, info):
+			return
 		self._raise_stale_ownership_marker()
 
 	def _create_ownership_marker(self) -> None:

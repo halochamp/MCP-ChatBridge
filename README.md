@@ -74,11 +74,12 @@ ChatGPT origin at the point of every DOM mutation. If a user changes tabs or the
 page navigates unexpectedly, the operation fails closed instead of following the
 new target. If startup or shutdown is cancelled or cannot confirm that the
 browser stopped, the bridge retains session ownership and the profile lock,
-writes a persistent `.unclean` ownership marker, and blocks reconnect. Restart
-alone is not recovery: first confirm that the dedicated browser is stopped,
-remove the marker named in the error, then restart the MCP process. A cancellation
-after a prompt has been submitted is not a rollback, so the next request must
-wait for explicit cleanup.
+writes a persistent `.unclean` ownership marker, and blocks reconnect. A
+persisted marker older than the recovery grace may self-clear only while the
+cross-process profile lock is held, process inspection succeeds, and no process
+names that exact `--user-data-dir`; any live owner or uncertain scan remains
+blocked. A cancellation after a prompt has been submitted is not a rollback, so
+the next request must wait for explicit cleanup.
 
 Before sending, `chatgpt_ask` verifies the visible composer still contains the
 exact normalized prompt in the same guarded runtime evaluation that clicks Send.
@@ -506,10 +507,11 @@ browser-use 0.12.9 จะคอยอ่าน cookie เมื่อใช้ p
 ที่จุด mutation ของ DOM หากผู้ใช้เปลี่ยน tab หรือหน้าเว็บนำทางไปที่อื่น งานจะ
 หยุดแบบ fail closed หากการเริ่มหรือปิด browser ถูกยกเลิก หรือยืนยันไม่ได้ว่า
 browser หยุดแล้ว bridge จะคง session ownership และ profile lock ไว้ เขียน marker
-`.unclean` และบล็อกการเชื่อมต่อใหม่ การ restart อย่างเดียวไม่ใช่การกู้คืน ต้อง
-ยืนยันก่อนว่า browser หยุดแล้ว ลบ marker ตามชื่อที่ error ระบุ แล้วจึง restart MCP
-process การยกเลิกหลังส่ง prompt แล้วไม่ใช่ rollback ดังนั้น request ถัดไปต้องรอ
-ให้ cleanup ชัดเจน
+`.unclean` และบล็อกการเชื่อมต่อใหม่ marker ที่ค้างเกินช่วง recovery grace จะลบตัวเอง
+ได้เฉพาะตอนที่ถือ cross-process profile lock อยู่ การตรวจ process สำเร็จ และไม่พบ
+process ใดระบุ `--user-data-dir` ตรงกับ profile นี้เท่านั้น หากยังมี owner หรือการ
+ตรวจ process ไม่ชัดเจนจะยังคงบล็อกแบบ fail closed การยกเลิกหลังส่ง prompt แล้วไม่ใช่
+rollback ดังนั้น request ถัดไปต้องรอให้ cleanup ชัดเจน
 
 ก่อนส่ง `chatgpt_ask` จะตรวจว่า composer ที่มองเห็นมี prompt ที่ normalize แล้ว
 ตรงกันทุกตัวอักษรใน runtime evaluation เดียวกับการคลิก Send หลังส่งจะต้องพบ

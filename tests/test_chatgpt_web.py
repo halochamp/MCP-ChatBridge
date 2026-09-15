@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -368,6 +370,49 @@ class ChatGPTWebBridgeTests(unittest.IsolatedAsyncioTestCase):
 			finally:
 				await first.close()
 			self.assertFalse(marker.exists())
+
+	async def test_old_ownership_marker_recovers_when_exact_profile_has_no_process_owner(self) -> None:
+		class Session:
+			async def start(self) -> None:
+				return None
+
+			async def kill(self) -> None:
+				return None
+
+		with tempfile.TemporaryDirectory() as temp_dir:
+			profile_dir = Path(temp_dir) / "profile"
+			bridge = ChatGPTWebBridge(profile_dir=profile_dir, session_factory=lambda **_: Session())
+			bridge._prepare_profile_dir()
+			marker = bridge._ownership_marker_file()
+			marker.touch(mode=0o600)
+			old = time.time() - 120
+			os.utime(marker, (old, old))
+
+			with patch.object(bridge, "_profile_browser_pids", return_value=[]):
+				await bridge._ensure_session()
+			self.assertTrue(marker.is_file())
+			self.assertEqual(marker, bridge._ownership_marker_path)
+			await bridge.close()
+			self.assertFalse(marker.exists())
+
+	async def test_old_ownership_marker_stays_blocked_when_owner_or_scan_is_uncertain(self) -> None:
+		with tempfile.TemporaryDirectory() as temp_dir:
+			profile_dir = Path(temp_dir) / "profile"
+			bridge = ChatGPTWebBridge(profile_dir=profile_dir)
+			bridge._prepare_profile_dir()
+			marker = bridge._ownership_marker_file()
+			marker.touch(mode=0o600)
+			old = time.time() - 120
+			os.utime(marker, (old, old))
+
+			for owners in ([4242], None):
+				with self.subTest(owners=owners), patch.object(
+					bridge, "_profile_browser_pids", return_value=owners
+				):
+					with self.assertRaisesRegex(ChatGPTWebError, "uncertain ownership"):
+						await bridge._ensure_session()
+					self.assertTrue(marker.is_file())
+					self.assertIsNone(bridge._profile_lock_handle)
 
 	async def test_profile_path_is_rechecked_before_use(self) -> None:
 		with tempfile.TemporaryDirectory() as temp_dir:
