@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 from typing import Any
@@ -31,7 +32,7 @@ async def no_sleep(_: float) -> None:
 
 class ScriptedBridge(ChatGPTWebBridge):
 	def __init__(self, states: list[dict[str, Any]]) -> None:
-		super().__init__(profile_dir=Path("/tmp/mcp-linkgpt-test-profile"), sleep=no_sleep, poll_interval=0)
+		super().__init__(profile_dir=Path("/tmp/mcp-chatbridge-test-profile"), sleep=no_sleep, poll_interval=0)
 		self.states = list(states)
 		self.navigations = 0
 		self.inserted: list[str] = []
@@ -82,7 +83,7 @@ class ChatGPTWebBridgeTests(unittest.IsolatedAsyncioTestCase):
 	async def test_page_state_does_not_scan_conversation_text_for_challenge_phrases(self) -> None:
 		class CapturingBridge(ChatGPTWebBridge):
 			def __init__(self) -> None:
-				super().__init__(profile_dir=Path("/tmp/mcp-linkgpt-capture-profile"))
+				super().__init__(profile_dir=Path("/tmp/mcp-chatbridge-capture-profile"))
 				self.expression = ""
 
 			async def _evaluate(self, expression: str) -> dict[str, Any]:
@@ -99,7 +100,7 @@ class ChatGPTWebBridgeTests(unittest.IsolatedAsyncioTestCase):
 	async def test_page_state_excludes_collapsible_user_turn_toggle_text(self) -> None:
 		class CapturingBridge(ChatGPTWebBridge):
 			def __init__(self) -> None:
-				super().__init__(profile_dir=Path("/tmp/mcp-linkgpt-capture-profile"))
+				super().__init__(profile_dir=Path("/tmp/mcp-chatbridge-capture-profile"))
 				self.expression = ""
 
 			async def _evaluate(self, expression: str) -> dict[str, Any]:
@@ -456,7 +457,7 @@ class ChatGPTWebBridgeTests(unittest.IsolatedAsyncioTestCase):
 			async def get_or_create_cdp_session(self, **_: Any) -> Any:
 				return CDPSession()
 
-		bridge = ChatGPTWebBridge(profile_dir=Path("/tmp/mcp-linkgpt-error-profile"))
+		bridge = ChatGPTWebBridge(profile_dir=Path("/tmp/mcp-chatbridge-error-profile"))
 		bridge._session = Session()  # type: ignore[assignment]
 
 		with self.assertRaisesRegex(ChatGPTWebError, "connection was lost") as raised:
@@ -550,7 +551,7 @@ class ChatGPTWebBridgeTests(unittest.IsolatedAsyncioTestCase):
 			def assert_focus_argument(self, focus: bool) -> None:
 				assert focus is False
 
-		bridge = ChatGPTWebBridge(profile_dir=Path("/tmp/mcp-linkgpt-target-test"))
+		bridge = ChatGPTWebBridge(profile_dir=Path("/tmp/mcp-chatbridge-target-test"))
 		bridge._session = Session()  # type: ignore[assignment]
 		with bridge._operation_scope():
 			self.assertEqual(await bridge._evaluate("1 + 1"), "ok")
@@ -584,7 +585,7 @@ class ChatGPTWebBridgeTests(unittest.IsolatedAsyncioTestCase):
 				assert focus is False
 				return CDPSession("target-a" if target_id is None else "target-b")
 
-		bridge = ChatGPTWebBridge(profile_dir=Path("/tmp/mcp-linkgpt-target-drift-test"))
+		bridge = ChatGPTWebBridge(profile_dir=Path("/tmp/mcp-chatbridge-target-drift-test"))
 		bridge._session = Session()  # type: ignore[assignment]
 		with bridge._operation_scope():
 			self.assertEqual(await bridge._evaluate("1 + 1"), "ok")
@@ -816,7 +817,7 @@ class ChatGPTWebBridgeTests(unittest.IsolatedAsyncioTestCase):
 	async def test_page_state_uses_structural_login_scope_and_document_identity(self) -> None:
 		class CapturingBridge(ChatGPTWebBridge):
 			def __init__(self) -> None:
-				super().__init__(profile_dir=Path("/tmp/mcp-linkgpt-page-state-test"))
+				super().__init__(profile_dir=Path("/tmp/mcp-chatbridge-page-state-test"))
 				self.expression = ""
 
 			async def _evaluate(self, expression: str) -> dict[str, Any]:
@@ -835,7 +836,7 @@ class ChatGPTWebBridgeTests(unittest.IsolatedAsyncioTestCase):
 
 		class CapturingBridge(ChatGPTWebBridge):
 			def __init__(self) -> None:
-				super().__init__(profile_dir=Path("/tmp/mcp-linkgpt-mutation-test"), sleep=no_sleep)
+				super().__init__(profile_dir=Path("/tmp/mcp-chatbridge-mutation-test"), sleep=no_sleep)
 
 			async def _assert_interactive_page(
 				self, *, expected_identity: tuple[str, str | None] | None = None
@@ -1135,6 +1136,64 @@ class ChatGPTWebBridgeTests(unittest.IsolatedAsyncioTestCase):
 		)
 		self.assertEqual(progress_events[-1], (100, "ChatGPT has finished and the final response is ready."))
 
+	async def test_completed_response_survives_failed_final_progress_notification(self) -> None:
+		progress_events: list[float] = []
+
+		async def report(progress: float, message: str) -> None:
+			progress_events.append(progress)
+			if progress == 100:
+				raise RuntimeError("progress transport disconnected")
+
+		bridge = ScriptedBridge(
+			[
+				state(),
+				state(assistant_count=1, latest_text="final answer", user_count=1, latest_user_text="prompt"),
+				state(assistant_count=1, latest_text="final answer", user_count=1, latest_user_text="prompt"),
+				state(assistant_count=1, latest_text="final answer", user_count=1, latest_user_text="prompt"),
+			]
+		)
+
+		result = await bridge.ask("prompt", timeout_seconds=10, progress=report)
+		self.assertEqual(progress_events[-1], 100)
+		self.assertEqual(result["status"], "completed")
+		self.assertEqual(result["response"], "final answer")
+		self.assertEqual(bridge.submits, 1)
+
+	async def test_completed_response_survives_stalled_final_progress_notification(self) -> None:
+		async def report(progress: float, message: str) -> None:
+			if progress == 100:
+				await asyncio.Event().wait()
+
+		bridge = ScriptedBridge(
+			[
+				state(),
+				state(assistant_count=1, latest_text="final answer", user_count=1, latest_user_text="prompt"),
+				state(assistant_count=1, latest_text="final answer", user_count=1, latest_user_text="prompt"),
+				state(assistant_count=1, latest_text="final answer", user_count=1, latest_user_text="prompt"),
+			]
+		)
+		with patch("chatgpt_web.PROGRESS_REPORT_TIMEOUT_SECONDS", 0.01):
+			result = await asyncio.wait_for(bridge.ask("prompt", timeout_seconds=10, progress=report), 0.5)
+		self.assertEqual(result["status"], "completed")
+		self.assertEqual(result["response"], "final answer")
+
+	async def test_cancelled_progress_does_not_promote_operation_to_completed(self) -> None:
+		async def report(progress: float, message: str) -> None:
+			if progress == 100:
+				raise asyncio.CancelledError()
+
+		bridge = ScriptedBridge(
+			[
+				state(),
+				state(assistant_count=1, latest_text="final answer", user_count=1, latest_user_text="prompt"),
+				state(assistant_count=1, latest_text="final answer", user_count=1, latest_user_text="prompt"),
+				state(assistant_count=1, latest_text="final answer", user_count=1, latest_user_text="prompt"),
+			]
+		)
+		with self.assertRaises(asyncio.CancelledError):
+			await bridge.ask("prompt", timeout_seconds=10, progress=report)
+		self.assertEqual(bridge.submits, 1)
+
 	async def test_progress_does_not_regress_when_response_turn_is_temporarily_hidden(self) -> None:
 		progress_events: list[tuple[float, str]] = []
 
@@ -1187,6 +1246,116 @@ class ChatGPTWebBridgeTests(unittest.IsolatedAsyncioTestCase):
 		self.assertEqual(completed_result["message"], "ChatGPT has finished and the final response is ready.")
 		self.assertEqual(in_progress_result["status"], "in_progress")
 		self.assertEqual(in_progress_result["message"], "ChatGPT is still generating a response.")
+
+	async def test_timeout_returns_full_owned_streaming_response_and_allows_later_recovery(self) -> None:
+		clock = {"now": 0.0}
+		generated = "prefix-" + "x" * 1800 + "-suffix"
+		progress_events: list[str] = []
+
+		async def tick(_: float) -> None:
+			clock["now"] += 1.0
+
+		async def report(progress: float, message: str) -> None:
+			progress_events.append(message)
+
+		bridge = ScriptedBridge([
+			state(),
+			state(assistant_count=1, latest_text=generated, streaming=True, user_count=1, latest_user_text="prompt"),
+			state(user_count=1, latest_user_text="prompt"),
+		])
+		bridge._sleep = tick
+		with patch("chatgpt_web.time", SimpleNamespace(monotonic=lambda: clock["now"], time=time.time)):
+			result = await bridge.ask("prompt", timeout_seconds=10, progress=report)
+
+		self.assertFalse(result["ok"])
+		self.assertEqual(result["status"], "timed_out")
+		self.assertEqual(result["response"], generated)
+		self.assertFalse(result["truncated"])
+		self.assertEqual(bridge.submits, 1)
+		self.assertTrue(any("Latest visible response tail:" in message for message in progress_events))
+		self.assertTrue(all(generated not in message for message in progress_events))
+
+		bridge.states = [state(assistant_count=1, latest_text=generated + "-complete")]
+		recovered = await bridge.last_response()
+		self.assertEqual(recovered["status"], "completed")
+		self.assertEqual(recovered["response"], generated + "-complete")
+		self.assertEqual(bridge.submits, 1)
+
+	async def test_timeout_without_owned_assistant_turn_does_not_return_stale_answer(self) -> None:
+		clock = {"now": 0.0}
+
+		async def tick(_: float) -> None:
+			clock["now"] += 1.0
+
+		bridge = ScriptedBridge([
+			state(assistant_count=1, latest_text="stale prior answer"),
+			state(assistant_count=1, latest_text="stale prior answer", streaming=True, user_count=1, latest_user_text="prompt"),
+		])
+		bridge._sleep = tick
+		with patch("chatgpt_web.time", SimpleNamespace(monotonic=lambda: clock["now"], time=time.time)):
+			with self.assertRaises(ChatGPTWebError):
+				await bridge.ask("prompt", timeout_seconds=10)
+		self.assertEqual(bridge.submits, 1)
+
+	async def test_timeout_truncates_owned_response_at_existing_safety_limit(self) -> None:
+		clock = {"now": 0.0}
+		generated = "x" * 100_005
+
+		async def tick(_: float) -> None:
+			clock["now"] += 1.0
+
+		bridge = ScriptedBridge([
+			state(),
+			state(assistant_count=1, latest_text=generated, streaming=True, user_count=1, latest_user_text="prompt"),
+		])
+		bridge._sleep = tick
+		with patch("chatgpt_web.time", SimpleNamespace(monotonic=lambda: clock["now"], time=time.time)):
+			result = await bridge.ask("prompt", timeout_seconds=10)
+		self.assertEqual(result["status"], "timed_out")
+		self.assertEqual(result["response"], generated[:100_000])
+		self.assertTrue(result["truncated"])
+
+	async def test_wrong_conversation_after_owned_partial_fails_closed(self) -> None:
+		bridge = ScriptedBridge([
+			state(),
+			state(assistant_count=1, latest_text="owned partial", streaming=True, user_count=1, latest_user_text="prompt"),
+			state(url="https://chatgpt.com/c/other", assistant_count=1, latest_text="wrong answer", user_count=1, latest_user_text="other"),
+		])
+		with self.assertRaisesRegex(ChatGPTWebError, "conversation changed"):
+			await bridge.ask("prompt", new_chat=False, timeout_seconds=10)
+
+	async def test_overlapping_ask_cannot_take_ownership_during_first_response(self) -> None:
+		entered = asyncio.Event()
+		release = asyncio.Event()
+		sleep_calls = 0
+
+		async def gated_sleep(_: float) -> None:
+			nonlocal sleep_calls
+			sleep_calls += 1
+			if sleep_calls == 1:
+				entered.set()
+				await release.wait()
+
+		bridge = ScriptedBridge([
+			state(),
+			state(assistant_count=1, latest_text="first answer", user_count=1, latest_user_text="first"),
+			state(assistant_count=1, latest_text="first answer", user_count=1, latest_user_text="first"),
+			state(assistant_count=1, latest_text="first answer", user_count=1, latest_user_text="first"),
+		])
+		bridge._sleep = gated_sleep
+		first = asyncio.create_task(bridge.ask("first", timeout_seconds=10))
+		await entered.wait()
+		second = asyncio.create_task(bridge.ask("second", timeout_seconds=10))
+		await asyncio.sleep(0)
+		self.assertEqual(bridge.submitted, ["first"])
+		second.cancel()
+		with self.assertRaises(asyncio.CancelledError):
+			await second
+		release.set()
+		result = await first
+		self.assertEqual(result["status"], "completed")
+		self.assertEqual(result["response"], "first answer")
+		self.assertEqual(bridge.submitted, ["first"])
 
 	async def test_new_chat_transition_is_pinned_to_submitted_prompt(self) -> None:
 		bridge = ScriptedBridge(

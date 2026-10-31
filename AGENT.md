@@ -1,6 +1,7 @@
-# MCP-LinkGPT — Agent Overview
+# MCP-ChatBridge — Agent Overview
 
 This file is the **quick operating map for an agent opened directly inside this public repository**.
+MCP-ChatBridge was formerly named MCP-LinkGPT.
 
 This project is self-contained. Do **not** assume access to a private parent repository or external agent procedure.
 
@@ -9,196 +10,51 @@ Read order:
 1. [`CLAUDE.md`](CLAUDE.md) — hard project constraints.
 2. **This file** — quick workflow and decision points.
 3. [`AGENT_PROCEDURE.md`](AGENT_PROCEDURE.md) — full repository-agent procedure.
-4. [`README.md`](README.md) — exact MCP-LinkGPT product/tool/browser contract, setup, and examples.
+4. [`README.md`](README.md) — exact tool/browser contract, setup, and examples.
 
 ## Core model
 
-MCP-LinkGPT lets a calling agent consult ChatGPT Web as a **read-only reviewer/advisor**.
+MCP-ChatBridge is a deterministic MCP bridge that lets a calling agent consult **ChatGPT Web, Gemini Web, or Claude Web** through each provider's own visible Chrome profile, and lets it generate images with Gemini or ChatGPT.
 
-The calling agent remains the worker and owns:
+- One tool per provider: `ask_chatgpt`, `ask_gemini`, `ask_claude`.
+- Lifecycle lives behind the `action` argument: `ask`, `status`, `last_response`, `new_chat`, `close`; plus `generate_image` for ChatGPT and Gemini.
+- The web chat is a **read-only advisor**. It cannot read local files. The calling agent gathers evidence, verifies the answer, and owns every edit, command, and test.
+- The page DOM changes often, so the bridge runs in **transcript mode**: it reads the whole conversation text and watches generic signals. The `response` is the whole chat (noise included), not just the answer. Read it yourself.
 
-- local evidence gathering;
-- implementation decisions;
-- edits;
-- commands/tests;
-- verification; and
-- the final answer.
+## Use it only when the user asks
 
-Never treat advisor output as locally verified fact.
+Call these tools only when the user asks for a web-chat opinion, review, or image, or names a provider. Do not call them because a task is hard. A generic request for an "advisor" is not a request for this bridge. Never switch provider silently after a failure; report the reason and ask.
 
-## Start every task
+Full rule: [`AGENT_PROCEDURE.md` — User-triggered rule](AGENT_PROCEDURE.md#3-user-triggered-rule).
 
-Before editing:
-
-1. read `CLAUDE.md`;
-2. inspect Git status;
-3. classify the task and define the smallest verifiable goal;
-4. read the relevant section of `AGENT_PROCEDURE.md`; and
-5. read the relevant `README.md` section when the task touches tool behavior, browser lifecycle, correlation, recovery, privacy, setup, or registration.
-
-Full procedure: [`AGENT_PROCEDURE.md` — Start-of-task procedure](AGENT_PROCEDURE.md#2-start-of-task-procedure).
-
-## Use LinkGPT only when the user asks
-
-LinkGPT is a **user-triggered advisor workflow**.
-
-Use it when the user explicitly asks to:
-
-- use LinkGPT / MCP-LinkGPT;
-- consult ChatGPT;
-- get a ChatGPT second opinion;
-- run an audit/review through ChatGPT Web; or
-- continue an existing LinkGPT review thread.
-
-Do not invoke it automatically just because another opinion might help.
-
-Once the user has requested LinkGPT for an issue, same-issue follow-ups and closure checks remain part of that authorized workflow.
-
-Full rule: [`AGENT_PROCEDURE.md` — User-triggered LinkGPT rule](AGENT_PROCEDURE.md#4-user-triggered-linkgpt-rule).
-
-## Advisor checkpoints
-
-After LinkGPT is authorized, use it **when evidence triggers a decision point**, not reflexively.
-
-### Before implementation
-
-Do one smallest direct local check first. Ask the advisor if material uncertainty remains, especially when multiple plausible designs, unfamiliar contracts, or an unverified assumption materially affect correctness.
-
-### Mid-work
-
-Pause before another material change when new evidence weakens the plan: a test contradicts the hypothesis, the first fix fails, scope expands across a high-risk boundary, two plausible next fixes remain, or local evidence is still inconsistent.
-
-### Before completion
-
-If the requested workflow includes a final audit, perform a closure review after local verification. Earlier consultations do not replace it.
-
-Do not chain advisor calls without new local work/evidence. If two consecutive advisor turns do not reduce uncertainty, stop the loop and narrow locally or ask the user.
-
-Full rule: [`AGENT_PROCEDURE.md` — Advisor checkpoints](AGENT_PROCEDURE.md#5-advisor-checkpoints).
-
-## Conversation rule: `new_chat`
-
-Use `new_chat=true` for:
-
-- the first call in a new review thread;
-- unrelated/materially different scope; or
-- an explicitly independent/fresh/from-scratch audit.
-
-Use `new_chat=false` for the same issue/review thread:
-
-- follow-up questions;
-- checking a previous finding after a fix;
-- mid-work uncertainty;
-- fix-and-recheck; and
-- same-thread closure audit.
-
-History carries previous reasoning, **not new code**. Every follow-up must still include the actual updated code/diff and new tests/observations inline.
-
-Full rule: [`AGENT_PROCEDURE.md` — Choosing new_chat](AGENT_PROCEDURE.md#9-choosing-new_chat).
-
-## Evidence rule
-
-For code review, send the **actual relevant source or diff inline**.
-
-Paths, line numbers, commit IDs, and anchors are provenance only. Never ask ChatGPT to fetch omitted local files, use another connector, or infer changes from paths.
-
-Never send credentials, cookies, tokens, private keys, session data, or unrelated private content.
-
-Full rule: [`AGENT_PROCEDURE.md` — Evidence package](AGENT_PROCEDURE.md#7-evidence-package-for-code-review).
-
-## Normal tool lifecycle
+## Quick workflow
 
 ```text
-chatgpt_status()
-  -> ready
-chatgpt_ask(...)
-  -> status="completed"
-validate advisor claims locally
-  -> edit/test locally
-same-thread follow-up when needed
-  -> new_chat=false
-closure audit when requested
-  -> new_chat=false if same issue
-chatgpt_close()
+ask_<provider>(action="status")        # once: open/check the profile, wait for ready
+ask_<provider>(action="ask", prompt="<complete focused request>", new_chat=true)
+ask_<provider>(action="last_response") # only after an explicit timeout, never to resend
+ask_<provider>(action="close")         # closes only that provider's browser session
 ```
 
-Key rules:
+- Accept only `ok=true` with `status="completed"` as an answer.
+- Send the evidence inline in the prompt, never secrets (the prompt goes to the provider).
+- Treat the answer as a hypothesis; verify it locally before acting.
+- Do not resend after a timeout or an ambiguous submit failure.
 
-- `chatgpt_status()` owns readiness waiting; continue only at `ready`.
-- Stop for login/challenge states.
-- Never call another browser tool while `chatgpt_ask()` is running.
-- Progress tails are provisional, not final advice.
-- Accept advice only after `status="completed"`.
-- Keep the browser open while the same review thread is active.
-- Close it when the thread completes, recovery is exhausted, or the review is abandoned.
+Full rules: [`AGENT_PROCEDURE.md` — Tool lifecycle](AGENT_PROCEDURE.md#6-tool-lifecycle) and [Failure and recovery](AGENT_PROCEDURE.md#8-failure-and-recovery).
 
-Full rule: [`AGENT_PROCEDURE.md` — Normal LinkGPT tool lifecycle](AGENT_PROCEDURE.md#10-normal-linkgpt-tool-lifecycle).
+## Images
 
-## Recovery rule
+`ask_gemini(action="generate_image", prompt="Generate an image: ...")` saves images to a folder outside the repository (default `~/Pictures/MCP-ChatBridge/gemini`). **Always send a detailed prompt**; see [`GEMINI_IMAGE_PROMPT_GUIDE_TH.md`](GEMINI_IMAGE_PROMPT_GUIDE_TH.md). `attach_images` attaches local PNG/JPEG/WEBP files for editing. ChatGPT can generate images too, but free accounts allow only a few per day: use it only when asked, never for tests.
 
-### Timeout
+Full rule: [`AGENT_PROCEDURE.md` — Images](AGENT_PROCEDURE.md#9-images-generation-and-attachments).
 
-Do **not** resend the prompt. Use bounded `chatgpt_last_response()` recovery and accept only `completed`.
+## When modifying MCP-ChatBridge itself
 
-### Other post-submit ownership/correlation error
+- Keep browser/session ownership, locking, and cleanup in the shared bridge layer (`common_bridge.py`, `chatgpt_web.py`); keep URL/login/challenge details in `providers/`.
+- Do not add per-turn DOM counters or exact selectors as a correctness dependency; keep transcript mode.
+- Run the full test suite after every change, then restart or reconnect the registered server and run one deliberate live check.
 
-Discard partial output. Do not use `chatgpt_last_response()` as advice, do not retry automatically, and do not open a fresh chat automatically. Report the incomplete advisory pass and require explicit user direction for a new attempt.
+Full rule: [`AGENT_PROCEDURE.md` — Working on MCP-ChatBridge itself](AGENT_PROCEDURE.md#10-working-on-mcp-chatbridge-itself).
 
-Full rules:
-
-- [`AGENT_PROCEDURE.md` — Timeout recovery](AGENT_PROCEDURE.md#11-timeout-recovery)
-- [`AGENT_PROCEDURE.md` — Ambiguous post-submit errors](AGENT_PROCEDURE.md#12-ambiguous-post-submit-errors)
-
-## When modifying MCP-LinkGPT itself
-
-A host-owned stdio MCP process does **not** hot-reload source changes.
-
-Therefore:
-
-- source/unit tests do not prove the currently registered tool is running new code;
-- do not kill the registered stdio server expecting the current host to reconnect;
-- use isolated development validation when appropriate;
-- restart/re-enter the host when a registered live acceptance test is required; and
-- distinguish source/test verification, isolated bridge verification, and registered-host verification.
-
-Full rule: [`AGENT_PROCEDURE.md` — Working on MCP-LinkGPT itself](AGENT_PROCEDURE.md#14-working-on-mcp-linkgpt-itself).
-
-## Verification
-
-After production code changes, run:
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-Inspect the final diff, preserve safety/ownership/correlation guarantees, and never weaken tests merely to make a change pass.
-
-Full rule: [`AGENT_PROCEDURE.md` — Code-change procedure](AGENT_PROCEDURE.md#15-code-change-procedure).
-
-## Documentation structure
-
-Keep responsibilities separate:
-
-- `CLAUDE.md` = hard constraints
-- `AGENT.md` = quick overview
-- `AGENT_PROCEDURE.md` = full agent workflow
-- `README.md` = product/tool/browser behavior and user documentation
-
-Do not duplicate the full procedure across files; link to the authoritative section.
-
-## Completion gate
-
-Before saying done, verify applicable items:
-
-- requested change is complete;
-- relevant tests/checks passed;
-- advisor findings used in the change were validated locally;
-- requested closure audit completed;
-- no ambiguous browser ownership remains;
-- browser is closed when the review thread is finished;
-- final diff contains only intended changes; and
-- final response distinguishes verified facts from assumptions.
-
-Full gate: [`AGENT_PROCEDURE.md` — Completion criteria](AGENT_PROCEDURE.md#19-completion-criteria).
-
-**Mental model:** local evidence -> LinkGPT advice -> local verification -> local action -> re-check -> closure.
+**Mental model:** local evidence -> web-chat answer -> local verification -> local action -> re-check -> closure.

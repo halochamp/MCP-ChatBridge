@@ -35,6 +35,7 @@ DEFAULT_WINDOW_Y = 60
 MAX_PROMPT_CHARS = 50_000
 MAX_RESPONSE_CHARS = 100_000
 MAX_PROGRESS_TAIL_CHARS = 1_200
+PROGRESS_REPORT_TIMEOUT_SECONDS = 2.0
 DEFAULT_READINESS_TIMEOUT_SECONDS = 30.0
 STALE_OWNERSHIP_RECOVERY_GRACE_SECONDS = 60.0
 CHATGPT_ORIGIN_GUARD_JS = """
@@ -95,6 +96,12 @@ class CookieSafeBrowserSession(BrowserSession):
 SessionFactory = Callable[..., BrowserSession]
 SleepFunction = Callable[[float], Awaitable[None]]
 ProgressReporter = Callable[[float, str], Awaitable[None]]
+# Runs inside the locked, pinned operation once the owned response is stable; the
+# returned mapping is merged into the final result (used for generated images).
+CompletionHook = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+# Runs inside the locked operation after the page identity is pinned and before the prompt is
+# typed (used to attach files). Raising stops the operation before anything is submitted.
+PromptHook = Callable[[], Awaitable[None]]
 
 
 def _canonical_profile_dir(value: Path | str) -> Path:
@@ -305,9 +312,9 @@ class ChatGPTWebBridge:
 
 		A persisted ``.unclean`` marker survives an MCP crash by design, but an
 		empty marker alone cannot distinguish a live orphaned Chrome from a stale
-		tombstone. Inspect argv while the cross-process profile flock is held and
+		tombstone.  Inspect argv while the cross-process profile flock is held and
 		only recover when process inspection succeeds and no process names this
-		exact ``--user-data-dir``. ``None`` means inspection failed and callers
+		exact ``--user-data-dir``.  ``None`` means inspection failed and callers
 		must stay fail-closed.
 		"""
 		try:
@@ -1120,8 +1127,11 @@ class ChatGPTWebBridge:
 				  if (normalize(composerValue) !== normalize(expectedPrompt)) return false;
 				  const selectors = [
 				    'button[data-testid="send-button"]',
+				    '#composer-submit-button',
 				    'button[aria-label="Send prompt"]',
-				    'button[aria-label="ส่งข้อความ"]'
+				    'button[aria-label="Send"]',
+				    'button[aria-label="ส่งข้อความ"]',
+				    'form:has(div[contenteditable="true"][data-virtualkeyboard="true"]) button[type="submit"]'
 				  ];
 				  const button = selectors.map((selector) => document.querySelector(selector)).find(Boolean);
 				  if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
@@ -1225,6 +1235,8 @@ class ChatGPTWebBridge:
 		timeout_seconds: int = 600,
 		strict_user_turn_text: bool = False,
 		progress: ProgressReporter | None = None,
+		on_completed: CompletionHook | None = None,
+		before_prompt: PromptHook | None = None,
 	) -> dict[str, Any]:
 		if not isinstance(prompt, str) or not prompt.strip():
 			raise ChatGPTWebError("Prompt must be a non-empty string.")
@@ -1239,7 +1251,13 @@ class ChatGPTWebBridge:
 			nonlocal reported_progress
 			if progress is not None:
 				reported_progress = max(reported_progress, percent)
-				await progress(reported_progress, message)
+				try:
+					await asyncio.wait_for(
+						progress(reported_progress, message), timeout=PROGRESS_REPORT_TIMEOUT_SECONDS
+					)
+				except Exception:
+					# Progress is telemetry; its transport must not consume the tool result.
+					pass
 
 		async with self._lock:
 			with self._operation_scope():
@@ -1276,6 +1294,9 @@ class ChatGPTWebBridge:
 				self._operation_page_identity = before_identity
 				self._operation_strict_user_turn_text = strict_user_turn_text
 
+				if before_prompt is not None:
+					await report(28, "Preparing attachments.")
+					await before_prompt()
 				await self._focus_and_clear_composer()
 				await self._insert_text(prompt)
 				await self._submit(prompt)
@@ -1287,9 +1308,11 @@ class ChatGPTWebBridge:
 				)
 
 				deadline = time.monotonic() + timeout_seconds
-				stable_text = ""
+				stable_text: Any = ""
 				stable_polls = 0
 				latest_state: dict[str, Any] = {}
+				latest_owned_text = ""
+				latest_owned_url: str | None = None
 				last_wait_state: str | None = None
 				last_progress_at = started
 				last_reported_tail = ""
@@ -1313,8 +1336,19 @@ class ChatGPTWebBridge:
 						await self._sleep(self._poll_interval)
 						continue
 					latest_text = str(latest_state.get("latest_text", "")).strip()
+					# An image-only turn has no text; it only counts when the caller will collect images.
+					latest_image_count = 0
+					if on_completed is not None:
+						try:
+							latest_image_count = max(0, int(latest_state.get("latest_image_count", 0) or 0))
+						except (TypeError, ValueError):
+							latest_image_count = 0
+					has_content = bool(latest_text) or latest_image_count > 0
 					is_new = int(latest_state.get("assistant_count", 0)) > before_count
 					is_streaming = bool(latest_state.get("streaming"))
+					if is_new and latest_text:
+						latest_owned_text = latest_text
+						latest_owned_url = latest_state.get("url")
 					response_started = response_started or is_new
 					wait_state = (
 						"generating"
@@ -1356,11 +1390,12 @@ class ChatGPTWebBridge:
 						last_progress_at = now
 						if response_tail:
 							last_reported_tail = response_tail
-					if is_new and latest_text and not is_streaming:
-						if latest_text == stable_text:
+					if is_new and has_content and not is_streaming:
+						stable_key = (latest_text, latest_image_count)
+						if stable_key == stable_text:
 							stable_polls += 1
 						else:
-							stable_text = latest_text
+							stable_text = stable_key
 							stable_polls = 1
 						if stable_polls >= 3:
 							truncated = len(latest_text) > MAX_RESPONSE_CHARS
@@ -1377,11 +1412,42 @@ class ChatGPTWebBridge:
 							if self._operation_correlation_warning is not None:
 								result["correlation_status"] = "rendering_fallback"
 								result["correlation_warning"] = self._operation_correlation_warning
+							if on_completed is not None:
+								try:
+									result.update(await on_completed(latest_state))
+								except ChatGPTWebError as exc:
+									# The response itself completed; never resend because collection failed.
+									result.update(
+										{
+											"ok": False,
+											"status": "completed_collection_failed",
+											"message": str(exc),
+											"error_type": type(exc).__name__,
+										}
+									)
 							return result
 					else:
 						stable_polls = 0
 					await self._sleep(self._poll_interval)
 
+				if latest_owned_text:
+					result = {
+						"ok": False,
+						"status": "timed_out",
+						"message": (
+							"Timed out while ChatGPT was generating. "
+							"The response may complete later; retrieve it with action=last_response without resending."
+						),
+						"error_type": "GenerationTimeoutError",
+						"response": latest_owned_text[:MAX_RESPONSE_CHARS],
+						"truncated": len(latest_owned_text) > MAX_RESPONSE_CHARS,
+						"url": latest_owned_url,
+						"elapsed_seconds": round(time.monotonic() - started, 2),
+					}
+					if self._operation_correlation_warning is not None:
+						result["correlation_status"] = "rendering_fallback"
+						result["correlation_warning"] = self._operation_correlation_warning
+					return result
 				raise ChatGPTWebError(
 					f"Timed out after {timeout_seconds} seconds while waiting for ChatGPT to finish its response. "
 					"The response may complete later; retrieve it with chatgpt_last_response."
