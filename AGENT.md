@@ -1,7 +1,6 @@
 # MCP-ChatBridge — Agent Overview
 
 This file is the **quick operating map for an agent opened directly inside this public repository**.
-MCP-ChatBridge was formerly named MCP-LinkGPT.
 
 This project is self-contained. Do **not** assume access to a private parent repository or external agent procedure.
 

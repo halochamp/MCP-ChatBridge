@@ -1,6 +1,6 @@
 # MCP-ChatBridge
 
-`MCP-ChatBridge` (formerly MCP-LinkGPT) is a small local MCP server that lets Codex explicitly consult
+`MCP-ChatBridge` is a small local MCP server that lets Codex explicitly consult
 three browser-based AI advisors through deterministic `browser-use`/CDP control:
 
 - ChatGPT Web

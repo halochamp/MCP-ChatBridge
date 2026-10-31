@@ -1,6 +1,6 @@
 # MCP-ChatBridge — Agent Procedure
 
-This document is the **complete repository-agent operating procedure** for working directly inside the public `MCP-ChatBridge` project (formerly `MCP-LinkGPT`).
+This document is the **complete repository-agent operating procedure** for working directly inside the public `MCP-ChatBridge` project.
 
 It is intentionally self-contained. Do not assume the agent can read another private repository, a parent workspace, or external project rules.
 
