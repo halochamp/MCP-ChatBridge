@@ -534,3 +534,7 @@ ask_chatgpt
 ask_gemini
 ask_claude
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
